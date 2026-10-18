@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CloudFormation Static Website</title>
+    <style>
+        /* Basic reset and styling */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: #333;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background-color: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+        }
+
+        h1 {
+            color: #1e3c72;
+            font-size: 2rem;
+            margin-bottom: 10px;
+            border-bottom: 3px solid #2a5298;
+            padding-bottom: 10px;
+            display: inline-block;
+        }
+
+        h2 {
+            color: #555;
+            font-size: 1.2rem;
+            margin-bottom: 25px;
+            font-weight: 500;
+        }
+
+        p {
+            line-height: 1.6;
+            margin-bottom: 15px;
+            color: #666;
+        }
+
+        .badge {
+            background-color: #e8f0fe;
+            color: #1a73e8;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            display: inline-block;
+            margin-top: 20px;
+            font-size: 0.9rem;
+        }
+
+        .footer {
+            margin-top: 30px;
+            font-size: 0.8rem;
+            color: #999;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- ASSIGNMENT REQUIREMENT: Header with L-number and Name -->
+        <h1>L00188357 - Cassiana de Oliveira</h1>
+        
+        <h2>AWS CloudFormation Static Website Assignment</h2>
+        
+        <p>This static website is hosted on an <strong>Amazon S3 bucket</strong> and delivered globally via <strong>Amazon CloudFront</strong> using a secure Origin Access Control (OAC).</p>
+        
+        <p>It was deployed using a fully scripted Infrastructure as Code (IaC) template.</p>
+
+        <div class="badge">
+            ✅ Deployment Successful
+        </div>
+    </div>
+
+    <div class="footer">
+        &copy; 2026 - CloudFormation Lab Assignment
+    </div>
+
+</body>
+</html>

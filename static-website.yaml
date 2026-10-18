@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  L00188357 - Cassiana de Oliveira.
+  Static Website Assignment - S3 + CloudFront (Secure, OAC).
+  This template creates a private S3 bucket for content, a CloudFront
+  distribution for public HTTPS access, and all necessary security policies.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "static-site"
+    Description: "A unique name for the project (used as prefix for resources)."
+
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: "Deployment environment (e.g., dev, staging, prod)."
+
+Resources:
+  # -------------------------------------------------------------------------
+  # S3 Bucket: Stores the static web content (HTML, CSS, JS, images).
+  # Note: The bucket is NOT configured for public website hosting.
+  # It is private and will only be accessible via CloudFront.
+  # -------------------------------------------------------------------------
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-content-${AWS::AccountId}"
+      # Block ALL public access to ensure the bucket is private (Best Practice).
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Enable versioning for content rollback capability.
+      VersioningConfiguration:
+        Status: Enabled
+      # Encryption at rest (security best practice).
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # -------------------------------------------------------------------------
+  # CloudFront Origin Access Control (OAC): Allows CloudFront to securely
+  # read from the private S3 bucket without making the bucket public.
+  # This is the modern replacement for Origin Access Identity (OAI).
+  # -------------------------------------------------------------------------
+  WebsiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${Environment}-oac"
+        Description: "OAC for static website S3 bucket"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -------------------------------------------------------------------------
+  # CloudFront Distribution: The public-facing web service (CDN).
+  # Provides HTTPS, caching, and global edge delivery.
+  # -------------------------------------------------------------------------
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "Static website distribution for ${ProjectName}-${Environment}"
+        DefaultRootObject: index.html
+        # HTTP to HTTPS redirect (Security best practice).
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "S3-${WebsiteBucket}"
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          # Use a managed cache policy for static content.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+        Origins:
+          - Id: !Sub "S3-${WebsiteBucket}"
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref WebsiteOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        ViewerCertificate:
+          # Use the default CloudFront certificate (*.cloudfront.net).
+          # For a custom domain, replace this with an ACM certificate ARN.
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        # Custom error responses for Single Page Applications (SPA) or
+        # general 404 handling: return index.html instead of an error.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # -------------------------------------------------------------------------
+  # S3 Bucket Policy: Explicitly grants the CloudFront distribution
+  # permission to read objects from the bucket via the OAC.
+  # -------------------------------------------------------------------------
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution.Id}"
+
+Outputs:
+  # -------------------------------------------------------------------------
+  # Outputs: Provide the essential information after deployment.
+  # -------------------------------------------------------------------------
+  BucketName:
+    Description: "Name of the S3 bucket holding the website content."
+    Value: !Ref WebsiteBucket
+
+  CloudFrontDomainName:
+    Description: "The public URL of the website (CloudFront domain)."
+    Value: !GetAtt WebsiteDistribution.DomainName
+
+  WebsiteURL:
+    Description: "Full HTTPS URL to access the website."
+    Value: !Sub "https://${WebsiteDistribution.DomainName}"
