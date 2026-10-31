@@ -1,0 +1,574 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  L00188357 - Cassiana de Oliveira.
+  Three-tier architecture: public ALB -> Web tier (nginx, ASG) -> internal ALB
+  -> App tier (ASG) -> RDS MySQL. Custom VPC, NAT, SSM access, encrypted storage.
+
+# ---------------------------------------------------------------------------
+# Groups parameters in the console UI (readability / teamwork best practice)
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "General" }
+        Parameters: [Environment, LatestAmiId]
+      - Label: { default: "Compute" }
+        Parameters: [InstanceType, MinSize, MaxSize]
+      - Label: { default: "Database" }
+        Parameters: [DBInstanceClass]
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: "Deployment environment. 'prod' enables Multi-AZ for the database."
+
+  # Resolves the newest Amazon Linux 2023 AMI in WHATEVER region you deploy to
+  # (replaces the hard-coded us-east-1 AMI ID).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # =========================================================================
+  # NETWORK: VPC, subnets, gateways, routing
+  # =========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-VPC" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-IGW" }
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public subnets: public ALB, NAT gateway, web tier ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Public-Subnet-1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Public-Subnet-2" }
+
+  # --- Private subnets: internal ALB, app tier, database ---
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.3.0/24
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Private-Subnet-1" }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.4.0/24
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Private-Subnet-2" }
+
+  # --- Public routing ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Public-RT" }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- NAT gateway: lets private instances reach the internet (yum/dnf, SSM)
+  # --- without being reachable from it. One NAT keeps lab cost down; a
+  # --- production design would use one per AZ.
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-NAT-EIP" }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-NAT" }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Private-RT" }
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =========================================================================
+  # SECURITY GROUPS: each tier only accepts traffic from the tier above it.
+  # No SSH anywhere; admin access is via SSM Session Manager.
+  # =========================================================================
+  PublicALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internet to public ALB (HTTP)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-PublicALB-SG" }
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB to web tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref PublicALBSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Web-SG" }
+
+  InternalALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web tier to internal ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-InternalALB-SG" }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB to app tier (port 8080)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref InternalALBSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-App-SG" }
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL from app tier only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-DB-SG" }
+
+  # =========================================================================
+  # IAM: instance role so we can use SSM Session Manager instead of SSH
+  # =========================================================================
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # =========================================================================
+  # DATABASE TIER: RDS MySQL (private, encrypted, backed up)
+  # =========================================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot          # keep a final snapshot if the stack is deleted
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      Engine: mysql
+      EngineVersion: "8.0"
+      MasterUsername: admin
+      ManageMasterUserPassword: true  # RDS creates/rotates the password in Secrets Manager
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      MultiAZ: !If [IsProd, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports: [error, slowquery]
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-MySQL" }
+
+  # =========================================================================
+  # APPLICATION TIER: internal ALB + Auto Scaling Group in private subnets
+  # =========================================================================
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroups: [!Ref InternalALBSecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-App-ALB" }
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required        # enforce IMDSv2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, VolumeSize: 8, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Environment}-App" }
+        # Tiny Python service on :8080. /health is for the ALB, /db proves the
+        # app tier can reach the database over TCP 3306.
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf update -y
+            cat > /opt/app.py <<'EOF'
+            import socket
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+            DB_HOST = "${DatabaseInstance.Endpoint.Address}"
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == "/health":
+                        code, body = 200, "ok"
+                    elif self.path == "/db":
+                        try:
+                            socket.create_connection((DB_HOST, 3306), timeout=3).close()
+                            code, body = 200, "Database reachable from app tier"
+                        except OSError:
+                            code, body = 503, "Database NOT reachable"
+                    else:
+                        code, body = 200, "<h1>App Tier - L00188357 - Cassiana de Oliveira</h1>"
+                    self.send_response(code)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+            HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+            EOF
+            cat > /etc/systemd/system/app.service <<'EOF'
+            [Unit]
+            Description=App tier service
+            After=network.target
+            [Service]
+            ExecStart=/usr/bin/python3 /opt/app.py
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now app
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PrivateRoute, DatabaseInstance, AppListener]  # needs NAT + DB endpoint first
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT2M
+    Properties:
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref AppTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-App", PropagateAtLaunch: true }
+
+  AppScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  # =========================================================================
+  # WEB TIER: public ALB + nginx Auto Scaling Group reverse-proxying to app
+  # =========================================================================
+  WebLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      SecurityGroups: [!Ref PublicALBSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Web-ALB" }
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebLoadBalancer
+      Port: 80
+      Protocol: HTTP          # HTTPS + ACM certificate would be the production upgrade
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, VolumeSize: 8, Encrypted: true, DeleteOnTermination: true }
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true   # public subnet, outbound via IGW
+            Groups: [!Ref WebSecurityGroup]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Environment}-Web" }
+        # nginx: /health answers the ALB locally, everything else is proxied
+        # to the internal app-tier load balancer.
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf update -y
+            dnf install -y nginx
+            cat > /etc/nginx/nginx.conf <<'EOF'
+            events {}
+            http {
+              server {
+                listen 80 default_server;
+                location = /health { return 200 "ok"; }
+                location / {
+                  proxy_pass http://${AppLoadBalancer.DNSName};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $remote_addr;
+                }
+              }
+            }
+            EOF
+            systemctl enable --now nginx
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PublicRoute, WebListener]
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT2M
+    Properties:
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      VPCZoneIdentifier: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref WebTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub "${Environment}-Web", PropagateAtLaunch: true }
+
+  WebScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+Outputs:
+  LoadBalancerURL:
+    Description: "Public URL of the web tier (try /db to test app-to-database connectivity)"
+    Value: !Sub "http://${WebLoadBalancer.DNSName}"
+
+  InternalAppEndpoint:
+    Description: "Internal ALB DNS name for the app tier (not reachable from the internet)"
+    Value: !GetAtt AppLoadBalancer.DNSName
+
+  DatabaseEndpoint:
+    Description: "RDS MySQL endpoint (private)"
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+
+  DatabaseSecretArn:
+    Description: "Secrets Manager ARN holding the generated DB credentials"
+    Value: !GetAtt DatabaseInstance.MasterUserSecret.SecretArn
